@@ -81,10 +81,15 @@ def parse_time(text: str) -> datetime:
     raise ValueError(f"Could not parse time: '{text}'")
 
 
-def get_weather_at(lat: float, lon: float, target_dt: datetime) -> dict:
-    """Fetch hourly weather from Open-Meteo for given coords."""
-    target_utc = target_dt.astimezone(pytz.utc)
-    date_str = target_utc.strftime("%Y-%m-%d")
+# Cache weather data to avoid redundant API calls within the same request
+_weather_cache = {}
+
+
+def fetch_weather_day(lat: float, lon: float, date_str: str) -> dict:
+    """Fetch a full day of hourly weather for a location. Cached per (lat, lon, date)."""
+    key = (round(lat, 4), round(lon, 4), date_str)
+    if key in _weather_cache:
+        return _weather_cache[key]
 
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -97,10 +102,17 @@ def get_weather_at(lat: float, lon: float, target_dt: datetime) -> dict:
         "start_date": date_str,
         "end_date": date_str,
     }
-
-    resp = requests.get(url, params=params, timeout=10)
+    resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
+    _weather_cache[key] = data
+    return data
+
+
+def get_weather_at(lat: float, lon: float, target_dt: datetime) -> dict:
+    """Get weather for a specific time at given coords. Uses day-level cache."""
+    date_str = target_dt.astimezone(PACIFIC).strftime("%Y-%m-%d")
+    data = fetch_weather_day(lat, lon, date_str)
 
     times = data["hourly"]["time"]
     temps = data["hourly"]["temperature_2m"]
