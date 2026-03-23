@@ -1,13 +1,10 @@
 """
 Weather + Commute Alert Tool
-Triggered when user sends "now" or a time like "9AM", "9:00AM", "10P" via WhatsApp.
-Responds with:
-- Current weather at home (440 Hudson St, Oakland, CA 94618)
-- Drive time + traffic to work (75 14th Street, San Francisco, CA 94103)
-- Temp at work on arrival
-- Temp at work 3 hours after arrival
-- Temp at work at 8PM
-- Temp at home at 9PM
+Triggered when user sends a time + direction, e.g.:
+  "now to work", "9AM to work", "6PM to home"
+
+"to work": home (Oakland) -> work (SF)
+"to home": work (SF) -> home (Oakland)
 """
 
 import re
@@ -27,12 +24,44 @@ HOME_ADDRESS = "440 Hudson St, Oakland, CA 94618"
 WORK_ADDRESS = "75 14th Street, San Francisco, CA 94103"
 
 
+def parse_trigger(text: str):
+    """
+    Parse trigger text like '9AM to work', 'now to home', '6:30P to work',
+    or shorthand 'now work', '9AM home', 'now to work'.
+    Returns (departure_dt, direction) where direction is 'work' or 'home'.
+    """
+    text = text.strip().lower()
+
+    # Strip 'to' so 'to work', 'to home', 'work', 'home' all match
+    text = re.sub(r'\bto\b', '', text).strip()
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+
+    if text.endswith('work'):
+        direction = 'work'
+        time_part = text[:-4].strip()
+    elif text.endswith('home'):
+        direction = 'home'
+        time_part = text[:-4].strip()
+    elif text.startswith('work'):
+        direction = 'work'
+        time_part = text[4:].strip()
+    elif text.startswith('home'):
+        direction = 'home'
+        time_part = text[4:].strip()
+    else:
+        raise ValueError("Message must include 'work' or 'home'. E.g. 'now to work', '9AM home', '6PM to work'")
+
+    departure_dt = parse_time(time_part if time_part else "now")
+    return departure_dt, direction
+
+
 def parse_time(text: str) -> datetime:
     """Parse 'now', '9AM', '9:00AM', '10P', '14:30' into a Pacific datetime (today)."""
     text = text.strip().upper()
     now = datetime.now(PACIFIC)
 
-    if text == "NOW":
+    if text in ("NOW", ""):
         return now
 
     # Normalize: "9P" -> "9PM", "10A" -> "10AM"
@@ -52,11 +81,7 @@ def parse_time(text: str) -> datetime:
 
 
 def get_weather_at(lat: float, lon: float, target_dt: datetime) -> dict:
-    """
-    Fetch hourly weather from Open-Meteo for given coords.
-    Returns temp (°F), weather description, wind speed for the hour nearest target_dt.
-    """
-    # Open-Meteo uses UTC
+    """Fetch hourly weather from Open-Meteo for given coords."""
     target_utc = target_dt.astimezone(pytz.utc)
     date_str = target_utc.strftime("%Y-%m-%d")
 
@@ -82,7 +107,6 @@ def get_weather_at(lat: float, lon: float, target_dt: datetime) -> dict:
     winds = data["hourly"]["windspeed_10m"]
     precip = data["hourly"]["precipitation_probability"]
 
-    # Find closest hour
     target_naive = target_dt.astimezone(PACIFIC).replace(tzinfo=None)
     best_idx = 0
     best_diff = float("inf")
@@ -98,12 +122,10 @@ def get_weather_at(lat: float, lon: float, target_dt: datetime) -> dict:
         "condition": wmo_to_description(codes[best_idx]),
         "wind_mph": round(winds[best_idx]),
         "precip_pct": precip[best_idx],
-        "time": times[best_idx],
     }
 
 
 def wmo_to_description(code: int) -> str:
-    """Convert WMO weather code to human-readable string."""
     mapping = {
         0: "Clear sky", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
         45: "Foggy", 48: "Icy fog",
@@ -116,16 +138,28 @@ def wmo_to_description(code: int) -> str:
     return mapping.get(code, f"Conditions (code {code})")
 
 
-def get_drive_time(departure_dt: datetime, google_maps_key: str) -> dict:
-    """Get drive time + traffic summary from home to work using Google Maps Directions API."""
+def weather_emoji(condition: str) -> str:
+    c = condition.lower()
+    if "thunderstorm" in c: return "⛈"
+    if "heavy rain" in c or "heavy shower" in c: return "🌧"
+    if "rain" in c or "drizzle" in c or "shower" in c: return "🌦"
+    if "snow" in c: return "❄️"
+    if "fog" in c: return "🌫"
+    if "overcast" in c: return "☁️"
+    if "partly cloudy" in c: return "⛅"
+    if "mostly clear" in c or "clear" in c: return "☀️"
+    return "🌤"
+
+
+def get_drive_time(origin: str, destination: str, departure_dt: datetime, google_maps_key: str) -> dict:
     if not google_maps_key:
-        return {"duration_min": None, "traffic_summary": "Traffic data unavailable (no API key)"}
+        return {"duration_min": None, "delay_min": 0, "distance": ""}
 
     departure_ts = int(departure_dt.timestamp())
     url = "https://maps.googleapis.com/maps/api/directions/json"
     params = {
-        "origin": HOME_ADDRESS,
-        "destination": WORK_ADDRESS,
+        "origin": origin,
+        "destination": destination,
         "departure_time": departure_ts,
         "traffic_model": "best_guess",
         "key": google_maps_key,
@@ -136,7 +170,7 @@ def get_drive_time(departure_dt: datetime, google_maps_key: str) -> dict:
     data = resp.json()
 
     if data["status"] != "OK":
-        return {"duration_min": None, "traffic_summary": f"Maps error: {data['status']}"}
+        return {"duration_min": None, "delay_min": 0, "distance": ""}
 
     leg = data["routes"][0]["legs"][0]
     normal_sec = leg["duration"]["value"]
@@ -144,82 +178,68 @@ def get_drive_time(departure_dt: datetime, google_maps_key: str) -> dict:
 
     normal_min = round(normal_sec / 60)
     traffic_min = round(traffic_sec / 60)
-    delay = traffic_min - normal_min
-
-    if delay <= 2:
-        traffic_label = "Light traffic"
-    elif delay <= 10:
-        traffic_label = f"Moderate traffic (+{delay} min)"
-    elif delay <= 20:
-        traffic_label = f"Heavy traffic (+{delay} min)"
-    else:
-        traffic_label = f"Very heavy traffic (+{delay} min)"
+    delay = max(0, traffic_min - normal_min)
 
     return {
         "duration_min": traffic_min,
-        "normal_min": normal_min,
-        "traffic_summary": traffic_label,
+        "delay_min": delay,
         "distance": leg["distance"]["text"],
     }
 
 
 def build_message(trigger_text: str, google_maps_key: str = None) -> str:
-    """Main function: parse trigger, gather data, build WhatsApp message."""
     now = datetime.now(PACIFIC)
-    departure_dt = parse_time(trigger_text)
+    departure_dt, direction = parse_trigger(trigger_text)
 
-    # If the parsed time is in the past (e.g. user says "9AM" at 10AM), assume tomorrow
+    # If time is in the past, assume tomorrow
     if departure_dt < now - timedelta(minutes=5):
         departure_dt += timedelta(days=1)
 
-    # --- Drive time ---
-    drive = get_drive_time(departure_dt, google_maps_key)
-    duration_min = drive.get("duration_min")
-    arrival_dt = departure_dt + timedelta(minutes=duration_min if duration_min else 45)
+    # Set origin/destination based on direction
+    if direction == "work":
+        origin_addr = HOME_ADDRESS
+        dest_addr = WORK_ADDRESS
+        origin_lat, origin_lon = HOME_LAT, HOME_LON
+        dest_lat, dest_lon = WORK_LAT, WORK_LON
+        origin_label = "home"
+        dest_label = "work"
+    else:
+        origin_addr = WORK_ADDRESS
+        dest_addr = HOME_ADDRESS
+        origin_lat, origin_lon = WORK_LAT, WORK_LON
+        dest_lat, dest_lon = HOME_LAT, HOME_LON
+        origin_label = "work"
+        dest_label = "home"
 
-    # --- Weather checkpoints ---
-    home_now = get_weather_at(HOME_LAT, HOME_LON, departure_dt)
-    work_arrival = get_weather_at(WORK_LAT, WORK_LON, arrival_dt)
-    work_3hr = get_weather_at(WORK_LAT, WORK_LON, arrival_dt + timedelta(hours=3))
+    # Drive time
+    drive = get_drive_time(origin_addr, dest_addr, departure_dt, google_maps_key)
+    duration_min = drive.get("duration_min") or 45
+    delay_min = drive.get("delay_min", 0)
+    arrival_dt = departure_dt + timedelta(minutes=duration_min)
+
+    # Weather
+    origin_now = get_weather_at(origin_lat, origin_lon, departure_dt)
+    dest_arrival = get_weather_at(dest_lat, dest_lon, arrival_dt)
     work_8pm = get_weather_at(WORK_LAT, WORK_LON, departure_dt.replace(hour=20, minute=0))
-    home_9pm = get_weather_at(HOME_LAT, HOME_LON, departure_dt.replace(hour=21, minute=0))
+    home_8pm = get_weather_at(HOME_LAT, HOME_LON, departure_dt.replace(hour=20, minute=0))
 
-    # --- Format message ---
     dep_str = departure_dt.strftime("%-I:%M %p")
     arr_str = arrival_dt.strftime("%-I:%M %p")
-    arr_3hr_str = (arrival_dt + timedelta(hours=3)).strftime("%-I:%M %p")
+
+    emoji = weather_emoji(origin_now["condition"])
+
+    # Traffic string
+    if delay_min <= 2:
+        traffic_str = "no delays"
+    else:
+        traffic_str = f"+{delay_min} min due to traffic"
 
     lines = [
-        f"🌤 *Weather & Commute Report*",
-        f"Departure: {dep_str}",
+        f"{emoji} At {origin_label} it's {origin_now['temp']}°F at {dep_str} with {origin_now['precip_pct']}% chance of rain and {origin_now['wind_mph']} mph wind.",
         "",
-        f"🏠 *Home now ({dep_str})*",
-        f"  {home_now['temp']}°F — {home_now['condition']}",
-        f"  Wind: {home_now['wind_mph']} mph | Rain chance: {home_now['precip_pct']}%",
+        f"🚗 It's gonna take you approx {duration_min} min to get to {dest_label} ({traffic_str}). You'll get there at around {arr_str} and it'll be {dest_arrival['temp']}°F with {dest_arrival['precip_pct']}% chance of rain and winds {dest_arrival['wind_mph']} mph.",
         "",
-        f"🚗 *Drive to SF*",
-    ]
-
-    if duration_min:
-        lines.append(f"  {drive['traffic_summary']} — {duration_min} min ({drive.get('distance', '')})")
-        lines.append(f"  Arriving ~{arr_str}")
-    else:
-        lines.append(f"  {drive['traffic_summary']}")
-        lines.append(f"  Estimated arrival: ~{arr_str}")
-
-    lines += [
-        "",
-        f"💼 *Work — SF (on arrival ~{arr_str})*",
-        f"  {work_arrival['temp']}°F — {work_arrival['condition']}",
-        "",
-        f"💼 *Work — SF at {arr_3hr_str} (+3 hrs)*",
-        f"  {work_3hr['temp']}°F — {work_3hr['condition']}",
-        "",
-        f"💼 *Work — SF at 8:00 PM*",
-        f"  {work_8pm['temp']}°F — {work_8pm['condition']}",
-        "",
-        f"🏠 *Home at 9:00 PM*",
-        f"  {home_9pm['temp']}°F — {home_9pm['condition']}",
+        f"Expect temperature to be {work_8pm['temp']}°F at work and {home_8pm['temp']}°F at home around 8PM tonight.",
     ]
 
     return "\n".join(lines)
@@ -227,6 +247,7 @@ def build_message(trigger_text: str, google_maps_key: str = None) -> str:
 
 if __name__ == "__main__":
     import sys
-    trigger = sys.argv[1] if len(sys.argv) > 1 else "now"
-    gmaps_key = sys.argv[2] if len(sys.argv) > 2 else None
+    gmaps_key = sys.argv[-1] if len(sys.argv) > 1 and sys.argv[-1].startswith("AIza") else None
+    args = sys.argv[1:-1] if gmaps_key else sys.argv[1:]
+    trigger = " ".join(args) if args else "now to work"
     print(build_message(trigger, gmaps_key))
