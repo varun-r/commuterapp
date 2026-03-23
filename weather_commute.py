@@ -296,5 +296,62 @@ def build_message(trigger_text: str, google_maps_key: str = None, bart_key: str 
     if direction == "work":
         origin_addr = HOME_ADDRESS
         dest_addr = WORK_ADDRESS
-        origin_lat, origin_lon = 
+        origin_lat, origin_lon = HOME_LAT, HOME_LON
+        dest_lat, dest_lon = WORK_LAT, WORK_LON
+        origin_label = "home"
+        dest_label = "work"
+    else:
+        origin_addr = WORK_ADDRESS
+        dest_addr = HOME_ADDRESS
+        origin_lat, origin_lon = WORK_LAT, WORK_LON
+        dest_lat, dest_lon = HOME_LAT, HOME_LON
+        origin_label = "work"
+        dest_label = "home"
 
+    # Drive time
+    drive = get_drive_time(origin_addr, dest_addr, departure_dt, google_maps_key)
+    duration_min = drive.get("duration_min") or 45
+    delay_min = drive.get("delay_min", 0)
+    arrival_dt = departure_dt + timedelta(minutes=duration_min)
+
+    # Weather
+    origin_now = get_weather_at(origin_lat, origin_lon, departure_dt)
+    dest_arrival = get_weather_at(dest_lat, dest_lon, arrival_dt)
+    work_8pm = get_weather_at(WORK_LAT, WORK_LON, departure_dt.replace(hour=20, minute=0))
+    home_8pm = get_weather_at(HOME_LAT, HOME_LON, departure_dt.replace(hour=20, minute=0))
+
+    dep_str = departure_dt.strftime("%-I:%M %p")
+    arr_str = arrival_dt.strftime("%-I:%M %p")
+
+    emoji = weather_emoji(origin_now["condition"])
+
+    if delay_min <= 2:
+        traffic_str = "no delays"
+    else:
+        traffic_str = f"+{delay_min} min due to traffic"
+
+    lines = [
+        f"{emoji} At {origin_label} it's {origin_now['temp']}°F at {dep_str} with {origin_now['precip_pct']}% chance of rain and {origin_now['wind_mph']} mph wind.",
+        "",
+        f"🚗 It's gonna take you approx {duration_min} min to get to {dest_label} ({traffic_str}). You'll get there at around {arr_str} and it'll be {dest_arrival['temp']}°F with {dest_arrival['precip_pct']}% chance of rain and winds {dest_arrival['wind_mph']} mph.",
+        "",
+        f"🚇 If you want to take BART, the next two trains at {'Rockridge' if direction == 'work' else '16th St Mission'} are at {get_bart_times('ROCK' if direction == 'work' else '16TH', bart_key)}.",
+        "",
+        snarky_recommendation(delay_min),
+    ]
+
+    if now.hour < 20:
+        lines += [
+            "",
+            f"Also looking ahead — expect temperature to be {work_8pm['temp']}°F at work and {home_8pm['temp']}°F at home around 8PM tonight.",
+        ]
+
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import sys
+    gmaps_key = os.environ.get("GOOGLE_MAPS_KEY")
+    bart_key = os.environ.get("BART_KEY")
+    trigger = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "now to work"
+    print(build_message(trigger, gmaps_key, bart_key))
