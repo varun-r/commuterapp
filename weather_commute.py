@@ -184,12 +184,14 @@ def get_bart_times(station: str, bart_key: str) -> str:
         url = f"https://api.bart.gov/api/etd.aspx?cmd=etd&orig={station}&key={bart_key}&json=y"
         data = None
         for _ in range(5):
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            candidate = resp.json()
-            if "station" in candidate.get("root", {}):
-                data = candidate
-                break
+            try:
+                resp = requests.get(url, timeout=10)
+                candidate = resp.json()
+                if "station" in candidate.get("root", {}):
+                    data = candidate
+                    break
+            except Exception:
+                pass
         if data is None:
             return "check bart.gov for times"
 
@@ -325,6 +327,7 @@ def build_message(trigger_text: str, google_maps_key: str = None, bart_key: str 
 
     emoji = weather_emoji(origin_now["condition"])
 
+    # Traffic string
     if delay_min <= 2:
         traffic_str = "no delays"
     else:
@@ -340,6 +343,7 @@ def build_message(trigger_text: str, google_maps_key: str = None, bart_key: str 
         snarky_recommendation(delay_min),
     ]
 
+    # Only show 8PM forecast if it's before 8PM
     if now.hour < 20:
         lines += [
             "",
