@@ -14,13 +14,14 @@ from weather_commute import build_message
 
 app = Flask(__name__)
 
-TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_NUMBER = "whatsapp:+14155238886"
 YOUR_WHATSAPP_NUMBER = "whatsapp:+19146562995"
-GOOGLE_MAPS_KEY = os.environ["GOOGLE_MAPS_KEY"]
+GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY", "")
+BART_KEY = os.environ.get("BART_KEY", "")
 
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
 
 
 @app.route("/webhook", methods=["POST"])
@@ -35,7 +36,7 @@ def webhook():
         return Response("Unauthorized", status=403)
 
     try:
-        report = build_message(incoming_msg, GOOGLE_MAPS_KEY)
+        report = build_message(incoming_msg, GOOGLE_MAPS_KEY, BART_KEY)
     except ValueError as e:
         report = f"Sorry, I couldn't parse that time. Try 'now', '9AM', '9:00AM', or '10P'.\n\nError: {e}"
     except Exception as e:
