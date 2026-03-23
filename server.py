@@ -20,6 +20,7 @@ TWILIO_WHATSAPP_NUMBER = "whatsapp:+14155238886"
 YOUR_WHATSAPP_NUMBER = "whatsapp:+19146562995"
 GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY", "")
 BART_KEY = os.environ.get("BART_KEY", "")
+WEATHER_KEY = os.environ.get("WEATHER_KEY", "")
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
 
@@ -36,7 +37,7 @@ def webhook():
         return Response("Unauthorized", status=403)
 
     try:
-        report = build_message(incoming_msg, GOOGLE_MAPS_KEY, BART_KEY)
+        report = build_message(incoming_msg, GOOGLE_MAPS_KEY, BART_KEY, WEATHER_KEY)
     except ValueError as e:
         report = f"Sorry, I couldn't parse that time. Try 'now', '9AM', '9:00AM', or '10P'.\n\nError: {e}"
     except Exception as e:

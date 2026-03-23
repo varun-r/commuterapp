@@ -81,52 +81,41 @@ def parse_time(text: str) -> datetime:
     raise ValueError(f"Could not parse time: '{text}'")
 
 
-def fetch_weather_both_locations(date_str: str) -> tuple:
+def fetch_weather_location(lat: float, lon: float, weather_key: str) -> list:
     """
-    Fetch home + work weather in a single API call.
-    Returns (home_hourly, work_hourly) where each is a dict of hourly arrays.
+    Fetch full day hourly forecast from WeatherAPI for a location.
+    Returns list of hourly dicts.
     """
-    url = "https://api.open-meteo.com/v1/forecast"
+    url = "http://api.weatherapi.com/v1/forecast.json"
     params = {
-        "latitude": f"{HOME_LAT},{WORK_LAT}",
-        "longitude": f"{HOME_LON},{WORK_LON}",
-        "hourly": "temperature_2m,weathercode,windspeed_10m,precipitation_probability",
-        "temperature_unit": "fahrenheit",
-        "windspeed_unit": "mph",
-        "timezone": "America/Los_Angeles",
-        "start_date": date_str,
-        "end_date": date_str,
-        "forecast_days": 1,
+        "key": weather_key,
+        "q": f"{lat},{lon}",
+        "days": 1,
+        "aqi": "no",
+        "alerts": "no",
     }
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
-    results = resp.json()  # returns a list of 2 location dicts
-    return results[0]["hourly"], results[1]["hourly"]
+    return resp.json()["forecast"]["forecastday"][0]["hour"]
 
 
-def extract_weather_at(hourly: dict, target_dt: datetime) -> dict:
-    """Extract weather for a specific hour from an hourly data dict."""
-    times = hourly["time"]
-    temps = hourly["temperature_2m"]
-    codes = hourly["weathercode"]
-    winds = hourly["windspeed_10m"]
-    precip = hourly["precipitation_probability"]
-
+def extract_weather_at(hours: list, target_dt: datetime) -> dict:
+    """Extract weather for the closest hour from WeatherAPI hourly list."""
     target_naive = target_dt.astimezone(PACIFIC).replace(tzinfo=None)
-    best_idx = 0
+    best = None
     best_diff = float("inf")
-    for i, t_str in enumerate(times):
-        t = datetime.fromisoformat(t_str)
+    for h in hours:
+        t = datetime.strptime(h["time"], "%Y-%m-%d %H:%M")
         diff = abs((t - target_naive).total_seconds())
         if diff < best_diff:
             best_diff = diff
-            best_idx = i
+            best = h
 
     return {
-        "temp": round(temps[best_idx]),
-        "condition": wmo_to_description(codes[best_idx]),
-        "wind_mph": round(winds[best_idx]),
-        "precip_pct": precip[best_idx],
+        "temp": round(best["temp_f"]),
+        "condition": best["condition"]["text"],
+        "wind_mph": round(best["wind_mph"]),
+        "precip_pct": best["chance_of_rain"],
     }
 
 
@@ -290,7 +279,7 @@ def get_drive_time(origin: str, destination: str, departure_dt: datetime, google
     }
 
 
-def build_message(trigger_text: str, google_maps_key: str = None, bart_key: str = None) -> str:
+def build_message(trigger_text: str, google_maps_key: str = None, bart_key: str = None, weather_key: str = None) -> str:
     now = datetime.now(PACIFIC)
     departure_dt, direction = parse_trigger(trigger_text)
 
@@ -320,17 +309,17 @@ def build_message(trigger_text: str, google_maps_key: str = None, bart_key: str 
     delay_min = drive.get("delay_min", 0)
     arrival_dt = departure_dt + timedelta(minutes=duration_min)
 
-    # Weather — single API call for both locations
-    date_str = departure_dt.astimezone(PACIFIC).strftime("%Y-%m-%d")
-    home_hourly, work_hourly = fetch_weather_both_locations(date_str)
+    # Weather — two API calls (one per location)
+    home_hours = fetch_weather_location(HOME_LAT, HOME_LON, weather_key)
+    work_hours = fetch_weather_location(WORK_LAT, WORK_LON, weather_key)
 
-    origin_hourly = home_hourly if direction == "work" else work_hourly
-    dest_hourly = work_hourly if direction == "work" else home_hourly
+    origin_hours = home_hours if direction == "work" else work_hours
+    dest_hours = work_hours if direction == "work" else home_hours
 
-    origin_now = extract_weather_at(origin_hourly, departure_dt)
-    dest_arrival = extract_weather_at(dest_hourly, arrival_dt)
-    work_8pm = extract_weather_at(work_hourly, departure_dt.replace(hour=20, minute=0))
-    home_8pm = extract_weather_at(home_hourly, departure_dt.replace(hour=20, minute=0))
+    origin_now = extract_weather_at(origin_hours, departure_dt)
+    dest_arrival = extract_weather_at(dest_hours, arrival_dt)
+    work_8pm = extract_weather_at(work_hours, departure_dt.replace(hour=20, minute=0))
+    home_8pm = extract_weather_at(home_hours, departure_dt.replace(hour=20, minute=0))
 
     dep_str = departure_dt.strftime("%-I:%M %p")
     arr_str = arrival_dt.strftime("%-I:%M %p")
@@ -367,5 +356,6 @@ if __name__ == "__main__":
     import sys
     gmaps_key = os.environ.get("GOOGLE_MAPS_KEY")
     bart_key = os.environ.get("BART_KEY")
+    weather_key = os.environ.get("WEATHER_KEY")
     trigger = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "now to work"
-    print(build_message(trigger, gmaps_key, bart_key))
+    print(build_message(trigger, gmaps_key, bart_key, weather_key))
