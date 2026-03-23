@@ -7,6 +7,7 @@ Triggered when user sends a time + direction, e.g.:
 "to home": work (SF) -> home (Oakland)
 """
 
+import os
 import re
 import requests
 from datetime import datetime, timedelta
@@ -151,6 +152,102 @@ def weather_emoji(condition: str) -> str:
     return "🌤"
 
 
+# BART travel times (minutes) for our two routes
+# Rockridge -> Civic Center (closest to 75 14th St SF): ~25 min
+# 16th St Mission -> Rockridge: ~27 min
+BART_TRAVEL_TIMES = {
+    "ROCK": 25,  # to SF (Civic Center)
+    "16TH": 27,  # to Rockridge
+}
+
+# Yellow line destination filters
+# To work: Rockridge -> SF, Yellow line goes South toward SF Airport / Daly City
+# To home: 16th St -> Rockridge, Yellow line goes North toward Antioch
+BART_DEST_FILTER = {
+    "ROCK": "South",   # SF-bound trains
+    "16TH": "North",   # East Bay-bound trains (Antioch/Berryessa)
+}
+
+
+def get_bart_times(station: str, bart_key: str) -> str:
+    """
+    Get next two BART departure times with arrival times.
+    Returns formatted string like '6:18 PM arrv 6:43 PM and 6:34 PM arrv 6:59 PM'
+    """
+    if not bart_key:
+        return "[no BART key]"
+
+    direction = BART_DEST_FILTER[station]
+    travel_min = BART_TRAVEL_TIMES[station]
+
+    try:
+        url = f"https://api.bart.gov/api/etd.aspx?cmd=etd&orig={station}&key={bart_key}&json=y"
+        data = None
+        for _ in range(5):
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            candidate = resp.json()
+            if "station" in candidate.get("root", {}):
+                data = candidate
+                break
+        if data is None:
+            return "check bart.gov for times"
+
+        now = datetime.now(PACIFIC)
+        departures = []
+
+        for etd in data["root"]["station"][0]["etd"]:
+            # For 16TH -> home, only include Antioch/Berryessa (Yellow line east)
+            if station == "16TH" and etd["destination"] not in ("Antioch", "Berryessa"):
+                continue
+            for est in etd["estimate"]:
+                if est["direction"] == direction:
+                    mins_raw = est["minutes"]
+                    if mins_raw == "Leaving":
+                        mins = 0
+                    else:
+                        try:
+                            mins = int(mins_raw)
+                        except ValueError:
+                            continue
+                    dep_time = now + timedelta(minutes=mins)
+                    arr_time = dep_time + timedelta(minutes=travel_min)
+                    departures.append((dep_time, arr_time))
+
+        departures.sort()
+        departures = departures[:2]
+
+        if not departures:
+            return "no trains found"
+
+        parts = []
+        for dep, arr in departures:
+            parts.append(f"{dep.strftime('%-I:%M %p')} arrv {arr.strftime('%-I:%M %p')}")
+        return " and ".join(parts)
+
+    except Exception as e:
+        return f"unavailable ({e})"
+
+
+def snarky_recommendation(delay_min: int) -> str:
+    import random
+    if delay_min > 10:
+        options = [
+            f"🚨 +{delay_min} min of traffic? Honestly, just take BART. Your car is not worth it today.",
+            f"😬 That's {delay_min} extra minutes sitting in your car doing nothing. BART is right there.",
+            f"🤦 +{delay_min} min delay. Bay Bridge traffic wins again. Maybe let BART have this one.",
+            f"📻 With +{delay_min} min of traffic, you'll really get to bond with whatever's on the radio. Or just take BART.",
+        ]
+    else:
+        options = [
+            f"✅ Traffic's light today. BART would have taken longer honestly — drive it.",
+            f"🚗 Only +{delay_min} min delay. You'd spend that waiting on a platform. Drive.",
+            f"😌 Traffic is basically nothing. Don't even think about BART today.",
+            f"🏎️ Light traffic — BART is for days like tomorrow. Today you drive.",
+        ]
+    return random.choice(options)
+
+
 def get_drive_time(origin: str, destination: str, departure_dt: datetime, google_maps_key: str) -> dict:
     if not google_maps_key:
         return {"duration_min": None, "delay_min": 0, "distance": ""}
@@ -187,7 +284,7 @@ def get_drive_time(origin: str, destination: str, departure_dt: datetime, google
     }
 
 
-def build_message(trigger_text: str, google_maps_key: str = None) -> str:
+def build_message(trigger_text: str, google_maps_key: str = None, bart_key: str = None) -> str:
     now = datetime.now(PACIFIC)
     departure_dt, direction = parse_trigger(trigger_text)
 
@@ -199,55 +296,4 @@ def build_message(trigger_text: str, google_maps_key: str = None) -> str:
     if direction == "work":
         origin_addr = HOME_ADDRESS
         dest_addr = WORK_ADDRESS
-        origin_lat, origin_lon = HOME_LAT, HOME_LON
-        dest_lat, dest_lon = WORK_LAT, WORK_LON
-        origin_label = "home"
-        dest_label = "work"
-    else:
-        origin_addr = WORK_ADDRESS
-        dest_addr = HOME_ADDRESS
-        origin_lat, origin_lon = WORK_LAT, WORK_LON
-        dest_lat, dest_lon = HOME_LAT, HOME_LON
-        origin_label = "work"
-        dest_label = "home"
-
-    # Drive time
-    drive = get_drive_time(origin_addr, dest_addr, departure_dt, google_maps_key)
-    duration_min = drive.get("duration_min") or 45
-    delay_min = drive.get("delay_min", 0)
-    arrival_dt = departure_dt + timedelta(minutes=duration_min)
-
-    # Weather
-    origin_now = get_weather_at(origin_lat, origin_lon, departure_dt)
-    dest_arrival = get_weather_at(dest_lat, dest_lon, arrival_dt)
-    work_8pm = get_weather_at(WORK_LAT, WORK_LON, departure_dt.replace(hour=20, minute=0))
-    home_8pm = get_weather_at(HOME_LAT, HOME_LON, departure_dt.replace(hour=20, minute=0))
-
-    dep_str = departure_dt.strftime("%-I:%M %p")
-    arr_str = arrival_dt.strftime("%-I:%M %p")
-
-    emoji = weather_emoji(origin_now["condition"])
-
-    # Traffic string
-    if delay_min <= 2:
-        traffic_str = "no delays"
-    else:
-        traffic_str = f"+{delay_min} min due to traffic"
-
-    lines = [
-        f"{emoji} At {origin_label} it's {origin_now['temp']}°F at {dep_str} with {origin_now['precip_pct']}% chance of rain and {origin_now['wind_mph']} mph wind.",
-        "",
-        f"🚗 It's gonna take you approx {duration_min} min to get to {dest_label} ({traffic_str}). You'll get there at around {arr_str} and it'll be {dest_arrival['temp']}°F with {dest_arrival['precip_pct']}% chance of rain and winds {dest_arrival['wind_mph']} mph.",
-        "",
-        f"Expect temperature to be {work_8pm['temp']}°F at work and {home_8pm['temp']}°F at home around 8PM tonight.",
-    ]
-
-    return "\n".join(lines)
-
-
-if __name__ == "__main__":
-    import sys
-    gmaps_key = sys.argv[-1] if len(sys.argv) > 1 and sys.argv[-1].startswith("AIza") else None
-    args = sys.argv[1:-1] if gmaps_key else sys.argv[1:]
-    trigger = " ".join(args) if args else "now to work"
-    print(build_message(trigger, gmaps_key))
+        origin_lat, origin_lon = 
